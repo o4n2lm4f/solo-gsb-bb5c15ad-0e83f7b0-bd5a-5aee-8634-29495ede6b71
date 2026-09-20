@@ -154,3 +154,95 @@ class CorrectionAuditResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="错误码")
     message: str
+
+
+# ---------- 发布快照 ----------
+
+
+class SnapshotIn(BaseModel):
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "幂等键：同一频道内重复携带相同键的请求返回同一快照；"
+            "不同频道互不影响"
+        ),
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class SnapshotResponse(BaseModel):
+    snapshot_id: str = Field(..., description="快照 ID，用于分页拉取快照内容")
+    channel: str
+    idempotency_key: str = Field(..., description="创建时携带的幂等键")
+    watermark: int = Field(
+        ...,
+        description="快照锁定的水位线；快照只包含 1..watermark 的定稿与缺口",
+    )
+    idempotent: bool = Field(
+        ...,
+        description="false=本次请求新建快照；true=幂等命中、返回先前创建的同一快照",
+    )
+    created_at: str = Field(..., description="快照创建时间（UTC ISO8601，幂等重试保持首次创建时间）")
+
+
+class SnapshotCorrection(BaseModel):
+    version: int = Field(..., description="更正版本，从 1 起递增")
+    text: str = Field(..., description="该版本的更正文本")
+    reason: str
+    created_at: str = Field(..., description="原更正落库时间（UTC ISO8601，随快照冻结）")
+
+
+class SnapshotItem(BaseModel):
+    kind: str = Field("subtitle", description="条目类型：subtitle=字幕；gap=永久缺口标记")
+    seq: int
+    revision: Optional[int] = Field(None, description="原始定稿修订号（仅字幕条目存在）")
+    original_text: Optional[str] = Field(
+        None,
+        description="快照时刻固化的原始定稿文本（仅字幕条目存在，永不改写）",
+    )
+    effective_text: Optional[str] = Field(
+        None,
+        description=(
+            "快照时刻固化的生效文本：未更正时等于 original_text，"
+            "否则为当时最新更正版本的文本（仅字幕条目存在）"
+        ),
+    )
+    correction_version: Optional[int] = Field(
+        None,
+        description=(
+            "快照时刻该序号的最新更正版本：字幕条目恒返回，0=快照时未更正；"
+            "缺口条目为 null"
+        ),
+    )
+    corrections: List[SnapshotCorrection] = Field(
+        default_factory=list,
+        description="快照时刻冻结的该序号全部更正版本（按 version 升序；缺口条目为空列表）",
+    )
+    start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
+    end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+
+
+class SnapshotItemsResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    watermark: int = Field(..., description="快照锁定的水位线，分页过程中恒定不变")
+    next_after: Optional[int] = Field(
+        None,
+        description=(
+            "下一页应使用的 after 值（本页最后一条的 seq）；"
+            "已到达快照末尾（本页条数不足 limit）时为 null"
+        ),
+    )
+    items: List[SnapshotItem] = Field(
+        ...,
+        description="本页快照条目，按 seq 升序混合返回字幕（含冻结更正链）与缺口标记",
+    )

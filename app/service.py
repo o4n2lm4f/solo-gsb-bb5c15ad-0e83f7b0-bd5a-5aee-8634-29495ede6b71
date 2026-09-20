@@ -16,9 +16,20 @@
 - expected_version 必须等于当前更正版本（无更正时为 0），否则返回
   version_conflict；“读取当前版本 -> 校验 -> 追加下一版本”在同一个
   BEGIN IMMEDIATE 事务内完成，竞争请求只有一个能成功。
+
+发布快照（snapshots）不变式：
+- 创建快照在单个 BEGIN IMMEDIATE 事务内完成：锁定频道当前水位线，
+  并把 1..watermark 的定稿/缺口、每条字幕的 original/effective 文本及
+  其当时最新更正版本、以及各序号的完整更正链一并固化到独立快照表；
+- 快照与工作数据物理隔离：之后的定稿、更正、缺口裁决只写原表，
+  快照表触发器禁止 UPDATE/DELETE，任何新变化都不会改变既有快照；
+- (channel, idempotency_key) 唯一：同一频道相同键的重试（含并发竞争
+  的落败方）返回先前创建的同一快照与首次创建时间；
+- 频道不存在时同样可以创建快照，固化 watermark=0、条目为空。
 """
 
 import sqlite3
+import uuid
 
 from .db import read_tx, write_tx
 
@@ -27,6 +38,16 @@ class CorrectionError(Exception):
     """更正 / 审计请求在业务前置条件上被拒绝；HTTP 层映射为 409/404。"""
 
     def __init__(self, error: str, message: str, status_code: int = 409):
+        super().__init__(message)
+        self.error = error
+        self.message = message
+        self.status_code = status_code
+
+
+class SnapshotError(Exception):
+    """快照请求在业务前置条件上被拒绝；HTTP 层映射为 404 等状态码。"""
+
+    def __init__(self, error: str, message: str, status_code: int = 404):
         super().__init__(message)
         self.error = error
         self.message = message
@@ -491,4 +512,197 @@ def list_corrections(channel: str, seq: int) -> dict:
                 }
                 for row in rows
             ],
+        }
+
+
+# ---------- 发布快照 ----------
+
+
+def create_snapshot(channel: str, idempotency_key: str) -> dict:
+    """为频道当前时刻的 1..watermark 定稿结果发布不可变快照。
+
+    整个过程在单个 BEGIN IMMEDIATE 事务内完成：读取（并因此经由写锁
+    锁定）频道当前水位线 -> 登记快照元数据 -> 用 INSERT ... SELECT
+    一次性固化条目与更正链。频道从不存在时水位线取 0、条目为空。
+    同一 (channel, idempotency_key) 的重复请求返回先前创建的同一快照。
+    """
+    with write_tx() as conn:
+        existing = conn.execute(
+            "SELECT snapshot_id, watermark, created_at FROM snapshots "
+            "WHERE channel = ? AND idempotency_key = ?",
+            (channel, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            return {
+                "snapshot_id": existing["snapshot_id"],
+                "channel": channel,
+                "idempotency_key": idempotency_key,
+                "watermark": existing["watermark"],
+                "idempotent": True,
+                "created_at": existing["created_at"],
+            }
+
+        row = conn.execute(
+            "SELECT watermark FROM channels WHERE channel = ?", (channel,)
+        ).fetchone()
+        watermark = row["watermark"] if row else 0
+        snapshot_id = uuid.uuid4().hex
+
+        row = conn.execute(
+            "INSERT INTO snapshots (snapshot_id, channel, idempotency_key, watermark) "
+            "VALUES (?, ?, ?, ?) RETURNING created_at",
+            (snapshot_id, channel, idempotency_key, watermark),
+        ).fetchone()
+        created_at = row["created_at"]
+
+        if watermark > 0:
+            _freeze_snapshot_items(conn, snapshot_id, channel, watermark)
+            _freeze_snapshot_corrections(conn, snapshot_id, channel, watermark)
+
+        return {
+            "snapshot_id": snapshot_id,
+            "channel": channel,
+            "idempotency_key": idempotency_key,
+            "watermark": watermark,
+            "idempotent": False,
+            "created_at": created_at,
+        }
+
+
+def _freeze_snapshot_items(conn, snapshot_id: str, channel: str, watermark: int) -> None:
+    """把 1..watermark 的定稿字幕与缺口标记一次性固化进 snapshot_items。
+
+    字幕条目用相关子查询连接当时的最新更正版本：original_text 取
+    finalized 原文，effective_text 取最新更正文本（无更正时回退原文），
+    correction_version 为 0 或当时最新版本号。
+    """
+    conn.execute(
+        """
+        INSERT INTO snapshot_items (
+            snapshot_id, seq, kind, revision, original_text, effective_text,
+            correction_version, start_seq, end_seq
+        )
+        SELECT ? AS snapshot_id, f.seq AS seq, 'subtitle' AS kind, f.revision AS revision,
+               f.text AS original_text,
+               COALESCE(c.text, f.text) AS effective_text,
+               COALESCE(c.version, 0) AS correction_version,
+               NULL AS start_seq, NULL AS end_seq
+        FROM finalized f
+        LEFT JOIN corrections c
+               ON c.channel = f.channel AND c.seq = f.seq
+              AND c.version = (
+                  SELECT MAX(c2.version) FROM corrections c2
+                  WHERE c2.channel = f.channel AND c2.seq = f.seq
+              )
+        WHERE f.channel = ? AND f.seq <= ?
+        UNION ALL
+        SELECT ? AS snapshot_id, g.seq AS seq, 'gap' AS kind, NULL AS revision,
+               NULL AS original_text, NULL AS effective_text,
+               NULL AS correction_version,
+               g.start_seq AS start_seq, g.end_seq AS end_seq
+        FROM gaps g
+        WHERE g.channel = ? AND g.seq <= ?
+        ORDER BY seq
+        """,
+        (snapshot_id, channel, watermark, snapshot_id, channel, watermark),
+    )
+
+
+def _freeze_snapshot_corrections(
+    conn, snapshot_id: str, channel: str, watermark: int
+) -> None:
+    """把各字幕序号截至快照时刻的完整更正链原样冻结（含原 created_at）。"""
+    conn.execute(
+        """
+        INSERT INTO snapshot_corrections (snapshot_id, seq, version, text, reason, created_at)
+        SELECT ?, c.seq, c.version, c.text, c.reason, c.created_at
+        FROM corrections c
+        WHERE c.channel = ? AND c.seq <= ?
+        """,
+        (snapshot_id, channel, watermark),
+    )
+
+
+def get_snapshot_items(snapshot_id: str, after: int, limit: int) -> dict:
+    """按 snapshot_id 分页拉取已固化的快照条目（after / limit 同定稿查询）。
+
+    快照不可变：分页过程中 watermark 与各条目内容恒定，后续字幕、更正
+    或缺口不会影响结果。next_after 供下一页使用，本页不足 limit 时为 null。
+    """
+    with read_tx() as conn:
+        meta = conn.execute(
+            "SELECT channel, watermark FROM snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if meta is None:
+            raise SnapshotError(
+                "snapshot_not_found",
+                f"快照 {snapshot_id} 不存在",
+            )
+
+        rows = conn.execute(
+            """
+            SELECT seq, kind, revision, original_text, effective_text,
+                   correction_version, start_seq, end_seq
+            FROM snapshot_items
+            WHERE snapshot_id = ? AND seq > ?
+            ORDER BY seq
+            LIMIT ?
+            """,
+            (snapshot_id, after, limit + 1),
+        ).fetchall()
+
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        items = []
+        for row in page:
+            if row["kind"] == "gap":
+                items.append(
+                    {
+                        "kind": "gap",
+                        "seq": row["seq"],
+                        "revision": None,
+                        "original_text": None,
+                        "effective_text": None,
+                        "correction_version": None,
+                        "corrections": [],
+                        "start_seq": row["start_seq"],
+                        "end_seq": row["end_seq"],
+                    }
+                )
+                continue
+            corrections = conn.execute(
+                "SELECT version, text, reason, created_at FROM snapshot_corrections "
+                "WHERE snapshot_id = ? AND seq = ? ORDER BY version",
+                (snapshot_id, row["seq"]),
+            ).fetchall()
+            items.append(
+                {
+                    "kind": "subtitle",
+                    "seq": row["seq"],
+                    "revision": row["revision"],
+                    "original_text": row["original_text"],
+                    "effective_text": row["effective_text"],
+                    "correction_version": row["correction_version"],
+                    "corrections": [
+                        {
+                            "version": c["version"],
+                            "text": c["text"],
+                            "reason": c["reason"],
+                            "created_at": c["created_at"],
+                        }
+                        for c in corrections
+                    ],
+                    "start_seq": None,
+                    "end_seq": None,
+                }
+            )
+
+        next_after = page[-1]["seq"] if has_more and page else None
+        return {
+            "snapshot_id": snapshot_id,
+            "channel": meta["channel"],
+            "watermark": meta["watermark"],
+            "next_after": next_after,
+            "items": items,
         }

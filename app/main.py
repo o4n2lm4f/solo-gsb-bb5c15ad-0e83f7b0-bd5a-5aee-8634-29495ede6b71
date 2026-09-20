@@ -16,6 +16,9 @@ from .schemas import (
     FragmentIn,
     GapDecisionIn,
     GapDecisionResponse,
+    SnapshotIn,
+    SnapshotItemsResponse,
+    SnapshotResponse,
     SubmitResponse,
 )
 
@@ -29,14 +32,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Live Subtitle Finalizer",
-    summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；支持追加式更正",
-    version="1.1.0",
+    summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；支持追加式更正与发布快照",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.CorrectionError)
 def correction_error_handler(request, exc: service.CorrectionError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.error, "message": exc.message},
+    )
+
+
+@app.exception_handler(service.SnapshotError)
+def snapshot_error_handler(request, exc: service.SnapshotError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.error, "message": exc.message},
@@ -115,3 +126,47 @@ def submit_correction(channel: str, seq: int, body: CorrectionIn) -> dict:
 def list_corrections(channel: str, seq: int) -> dict:
     """查询某定稿序号的全部更正记录，按更正版本（version）升序返回。"""
     return service.list_corrections(channel, seq)
+
+
+# ---------- 发布快照 ----------
+
+
+@app.post(
+    "/channels/{channel}/snapshots",
+    response_model=SnapshotResponse,
+    status_code=200,
+    responses={422: {"description": "请求体校验失败"}},
+)
+def create_snapshot(channel: str, body: SnapshotIn) -> dict:
+    """为频道当前时刻的定稿结果发布不可变快照。
+
+    - 在**单个事务**内锁定频道当前 watermark，并把 ``1..watermark`` 的
+      定稿字幕（original/effective 文本、当时最新 correction_version）
+      与永久缺口标记、以及各字幕序号的**完整更正链**一并固化；
+    - 同一频道内相同 ``idempotency_key`` 的重试（含并发请求）返回**同一
+      快照**（相同 snapshot_id、watermark 与首次创建时间），`idempotent=true`；
+      幂等键在不同频道之间互不影响；
+    - 快照一经发布即不可变：之后新到的字幕、追加的更正或新裁决的缺口
+      都不会改变既有快照；
+    - 不存在的频道也可发布快照：固化 ``watermark=0`` 的空快照。
+    """
+    return service.create_snapshot(channel, body.idempotency_key)
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/items",
+    response_model=SnapshotItemsResponse,
+    responses={404: {"description": "快照不存在", "model": ErrorResponse}},
+)
+def get_snapshot_items(
+    snapshot_id: str,
+    after: int = Query(0, ge=0, description="只返回序号大于该值的快照条目（字幕与缺口统一计数）"),
+    limit: int = Query(1000, ge=1, le=10000, description="每页最多返回条目数"),
+) -> dict:
+    """按 ``snapshot_id`` 分页拉取快照内容（按序号升序混合返回字幕与缺口）。
+
+    返回内容恒为发布时刻的固化结果，与频道之后的定稿 / 更正 / 缺口无关；
+    当本页恰好取满 ``limit`` 条且仍有后续数据时，响应中的 ``next_after``
+    为下一页应使用的 ``after``，已到快照末尾时为 ``null``。
+    """
+    return service.get_snapshot_items(snapshot_id, after=after, limit=limit)
