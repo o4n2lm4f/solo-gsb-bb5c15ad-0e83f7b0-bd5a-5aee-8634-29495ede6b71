@@ -16,6 +16,11 @@ from .schemas import (
     FragmentIn,
     GapDecisionIn,
     GapDecisionResponse,
+    SnapshotCorrectionsResponse,
+    SnapshotCreateIn,
+    SnapshotItemsEffectiveResponse,
+    SnapshotItemsResponse,
+    SnapshotResponse,
     SubmitResponse,
 )
 
@@ -29,14 +34,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Live Subtitle Finalizer",
-    summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；支持追加式更正",
-    version="1.1.0",
+    summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
+    "支持追加式更正与不可变发布快照",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.CorrectionError)
 def correction_error_handler(request, exc: service.CorrectionError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.error, "message": exc.message},
+    )
+
+
+@app.exception_handler(service.SnapshotError)
+def snapshot_error_handler(request, exc: service.SnapshotError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.error, "message": exc.message},
@@ -115,3 +129,58 @@ def submit_correction(channel: str, seq: int, body: CorrectionIn) -> dict:
 def list_corrections(channel: str, seq: int) -> dict:
     """查询某定稿序号的全部更正记录，按更正版本（version）升序返回。"""
     return service.list_corrections(channel, seq)
+
+
+# ---------- 发布快照 ----------
+
+
+@app.post(
+    "/channels/{channel}/snapshots",
+    response_model=SnapshotResponse,
+    status_code=200,
+    responses={422: {"description": "请求体校验失败（idempotency_key 为空等）"}},
+)
+def create_snapshot(channel: str, body: SnapshotCreateIn) -> dict:
+    """为频道创建发布快照。
+
+    - 单个 `BEGIN IMMEDIATE` 事务内锁定频道当前 watermark，并把
+      1..watermark 的字幕（原始 + 快照时刻生效文本）、缺口标记及各条
+      更正版本整体固化到快照表；
+    - 同一频道携带相同 `idempotency_key` 重试始终返回同一快照
+      （`idempotent=true`），不会重复冻结；
+    - 不存在的频道也可创建 `watermark=0` 的空快照；
+    - 快照创建后，后续新定稿、新更正或新缺口都不会改变既有快照。
+    """
+    return service.create_snapshot(channel, body.idempotency_key)
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/items",
+    response_model=Union[SnapshotItemsResponse, SnapshotItemsEffectiveResponse],
+    responses={404: {"description": "快照不存在", "model": ErrorResponse}},
+)
+def get_snapshot_items(
+    snapshot_id: str,
+    after: int = Query(0, ge=0, description="只返回序号大于该值的快照条目（字幕与缺口统一计数）"),
+    limit: int = Query(1000, ge=1, le=10000),
+    view: Literal["original", "effective"] = Query(
+        "original",
+        description="original=快照冻结的原始定稿（默认）；"
+        "effective=快照时刻冻结的最新更正文本并返回 correction_version",
+    ),
+) -> dict:
+    """按 snapshot_id 分页拉取快照条目（按序号升序混合字幕与缺口标记）。"""
+    return service.get_snapshot(snapshot_id, after=after, limit=limit, view=view)
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/items/{seq}/corrections",
+    response_model=SnapshotCorrectionsResponse,
+    responses={
+        404: {"description": "快照不存在，或该序号超出快照水位线", "model": ErrorResponse},
+        409: {"description": "该序号在快照中为永久缺口", "model": ErrorResponse},
+    },
+)
+def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
+    """查询快照内某字幕序号在快照时刻冻结的全部更正版本（按 version 升序）。"""
+    return service.list_snapshot_corrections(snapshot_id, seq)

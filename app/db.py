@@ -88,6 +88,83 @@ BEFORE DELETE ON corrections
 BEGIN
     SELECT RAISE(ABORT, 'corrections is append-only: DELETE is forbidden');
 END;
+
+-- 发布快照：创建时刻在同一事务内冻结频道 watermark。下游按 snapshot_id
+-- 分批拉取，后续字幕 / 更正 / 缺口只写入原表，任何既有快照都不再变化。
+-- idempotency_key 在频道范围内唯一：重试同一 key 必须返回同一快照。
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id     TEXT PRIMARY KEY,
+    channel         TEXT NOT NULL,
+    watermark       INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (channel, idempotency_key)
+);
+
+-- 快照条目：1..watermark 每个序号一行，字幕同时固化 original 与
+-- 创建时刻的 effective（最新更正）文本及该最新更正版本；缺口行固化区间端点。
+CREATE TABLE IF NOT EXISTS snapshot_items (
+    snapshot_id        TEXT NOT NULL,
+    seq                INTEGER NOT NULL,
+    kind               TEXT NOT NULL,
+    revision           INTEGER,
+    original_text      TEXT,
+    effective_text     TEXT,
+    correction_version INTEGER,
+    start_seq          INTEGER,
+    end_seq            INTEGER,
+    PRIMARY KEY (snapshot_id, seq),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots (snapshot_id)
+);
+
+-- 快照内每个字幕序号当时存在的全部更正版本（完整更正历史的冻结副本）
+CREATE TABLE IF NOT EXISTS snapshot_corrections (
+    snapshot_id TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    version     INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, seq, version),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots (snapshot_id)
+);
+
+-- 快照整体不可变：三张快照表在存储层禁止任何改写与删除
+CREATE TRIGGER IF NOT EXISTS snapshots_no_update
+BEFORE UPDATE ON snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'snapshots are immutable: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS snapshots_no_delete
+BEFORE DELETE ON snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'snapshots are immutable: DELETE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_items_no_update
+BEFORE UPDATE ON snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_items are immutable: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_items_no_delete
+BEFORE DELETE ON snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_items are immutable: DELETE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_corrections_no_update
+BEFORE UPDATE ON snapshot_corrections
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_corrections are immutable: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS snapshot_corrections_no_delete
+BEFORE DELETE ON snapshot_corrections
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_corrections are immutable: DELETE is forbidden');
+END;
 """
 
 _lock = threading.RLock()
